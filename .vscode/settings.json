@@ -4,6 +4,8 @@
 		"**/.git": false
 	},
 	"search.exclude": {
-		"target": true
+		"target": true,
+		".git": true,
+		"assets": true
 	}
 }
