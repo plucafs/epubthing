@@ -1,0 +1,34 @@
+# TODO
+
+- [x] Add a View menu item, with a Fullscreen item that when clicked makes the window go into exclusive fullscreen
+- [x] Ctrl+R opens a recent files window (like VSCode): scrollable list of recently opened EPUB filenames, search/filter bar, click to open, each line has an X button to remove it from the list
+- [x] Font size is not applied when changed in settings
+- [x] Move the settings window (e.g., from a modal window to a side panel or a different approach)
+- [x] Add a setting to choose the alignment of the text box: left, center, right
+- [x] Don't wrap the titles of the chapters in the sidebar
+- [x] Add a tooltip showing the full chapter title when hovering over it in the sidebar
+- [x] Add a "Recent Files" item in the File menu that opens the recent files window
+- [x] Let the user scroll through the Recent Files list using up and down arrow keys
+- [x] The settings window should be centered on screen
+- [x] Chapter search (like Firefox): Ctrl+F opens a search bar with three toggle buttons: Highlight all, Match case, Whole words
+- [x] Ctrl+O should trigger File > Open
+- [x] Make the vertical scrollbar of the text box always visible
+- [x] Under File menu, add an "Open Directory" item to open all EPUBs in a directory
+- [x] Show reading progress at the bottom of the text box: percentage to the end of the chapter
+- [x] Right-click context menu on text with classic options: Select All, Copy, etc.
+- Handle AZW3 format as well
+- Support MOBI format
+- [x] Fix formatting errors: some ebooks have strangely spaced characters (e.g., "I C AN B E T HERE FOR M Y C HILDREN")
+- Fix formatting errors: text like "CHAPTER I\nSTREET EPISTEMOLOGY\nt/\n\nNoun: A public thoroughfare.\n/\n\nNoun: The study of knowledge." is rendered incorrectly - the "/" separators and multi-line definitions are not handled properly
+- [x] Remember the chapter and scroll position inside the chapter for each book
+- [x] Only the text inside the text box should be selectable (not other UI elements)
+- [x] Show a visual indicator when the reading position is saved (UX improvement)
+- [x] Add a setting toggle to enable/disable saving the reading position
+- [x] Integrate with Linux desktop environments (KDE): support "Open with" to open EPUB files with the app, register as an EPUB handler
+- Chat-like interface for highlights: select text, push into a chat where user messages are personal notes and book messages are highlighted snippets
+- [x] When pressing Ctrl+R, the first element of the Recent Files list should be automatically selected and highlighted
+- Implement "go to note" linking: support internal note links and external links
+- Improve image loading: handle images properly (current implementation may have issues)
+- [x] Conversation: populate timestamp field (currently always 0)
+- [x] Chat-like interface for highlights (named "Conversation"): right side panel, togglable, saved visibility. RMB on selected text -> "Add to conversation". Book highlights on left, user notes on right. Big text box at bottom for adding notes. Persist based on EPUB filename. Import/Export. View/add/delete entries. Clicking a highlight jumps to the text.
+- [x] font loading: executing the executable crashes if not fonts areavailable. if the fonts folder isn't available, fallback to the default one

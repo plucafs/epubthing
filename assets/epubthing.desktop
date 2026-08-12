@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=epubthing
+GenericName=EPUB Reader
+Comment=Read EPUB books
+Exec=epubthing %f
+Icon=epubthing
+Terminal=false
+Type=Application
+Categories=Office;Viewer;
+MimeType=application/epub+zip;
+Keywords=epub;ebook;reader;book;
