@@ -19,7 +19,7 @@ An epub reader
 ![alt text](assets/screenshot.png)
 
 # Download
-[Linux (direct download)](https://github.com/plucafs/epubthing/releases/download/v0.1.0/epubthing-linux)
+[Linux (direct download)](https://github.com/plucafs/epubthing/releases/download/v0.1.1/epubthing-linux)
 
 ## Credits
 - [pi](https://github.com/earendil-works/pi)
