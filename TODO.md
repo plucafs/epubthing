@@ -32,3 +32,5 @@
 - [x] Conversation: populate timestamp field (currently always 0)
 - [x] Chat-like interface for highlights (named "Conversation"): right side panel, togglable, saved visibility. RMB on selected text -> "Add to conversation". Book highlights on left, user notes on right. Big text box at bottom for adding notes. Persist based on EPUB filename. Import/Export. View/add/delete entries. Clicking a highlight jumps to the text.
 - [x] font loading: executing the executable crashes if not fonts areavailable. if the fonts folder isn't available, fallback to the default one
+- Offer a version without fonts embedded
+- Let the user import custom fonts/scan for a specific/custom directory to find fonts
