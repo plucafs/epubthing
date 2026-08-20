@@ -5,20 +5,19 @@ mod ui;
 
 use eframe::egui;
 use eframe::egui::Color32;
-use epubthing::{resolve_path, ContentSegment};
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use app::fonts;
-use app::loading::{self as loading_mod, LoadedDocument, LoadingTask};
-use app::search::{self as search_mod, ChapterSearchData, SearchState};
+use app::loading::{self as loading_mod, LoadedDocument, LoadingTask, TocEntry};
 use config::{config_path, load_config, save_config, AppConfig, ReadingPosition};
 use conversation::{
     export_conversation, import_conversation, load_conversation, save_conversation,
     ConversationMessage,
 };
+use ui::reader::{self, MarkdownReader};
 
 // ─── Config (see config/ module) ───────────────────────────────────────────
 
@@ -78,6 +77,135 @@ fn open_directory(path: &std::path::Path) -> std::io::Result<()> {
     }
 }
 
+// ─── TOC tree (sidebar) ────────────────────────────────────────────────────
+
+/// Whether an entry (or any descendant) matches the sidebar search query.
+fn toc_matches(entry: &TocEntry, query: &str) -> bool {
+    if entry.label.to_lowercase().contains(query) {
+        return true;
+    }
+    entry.children.iter().any(|child| toc_matches(child, query))
+}
+
+/// Collects the spine indexes covered by a TOC tree. Entries pointing at the
+/// same spine item share one index by construction.
+fn collect_toc_chapters(entry: &TocEntry, out: &mut HashSet<usize>) {
+    if let Some(index) = entry.chapter {
+        out.insert(index);
+    }
+    for child in &entry.children {
+        collect_toc_chapters(child, out);
+    }
+}
+
+/// Renders one TOC entry: a clickable leaf or a collapsible container.
+fn show_toc_entry(
+    ui: &mut egui::Ui,
+    entry: &TocEntry,
+    query: &str,
+    current_chapter: usize,
+    chapter_to_set: &mut Option<usize>,
+) {
+    if entry.children.is_empty() {
+        if !query.is_empty() && !entry.label.to_lowercase().contains(query) {
+            return;
+        }
+        show_toc_leaf(ui, entry, current_chapter, chapter_to_set);
+        return;
+    }
+
+    if !query.is_empty() && !toc_matches(entry, query) {
+        return;
+    }
+
+    let selected = entry.chapter == Some(current_chapter);
+    let selection_color = ui.visuals().selection.stroke.color;
+    let text = egui::RichText::new(&entry.label)
+        .strong()
+        .color(if selected {
+            selection_color
+        } else {
+            ui.visuals().text_color()
+        });
+
+    let id = ui.make_persistent_id(entry.href.as_str());
+    let state = egui::containers::collapsing_header::CollapsingState::load_with_default_open(
+        ui.ctx(),
+        id,
+        false,
+    );
+
+    let header = state.show_header(ui, |ui| {
+        let width = ui.available_width().max(0.0);
+        let response = ui.add_sized(
+            [width, 0.0],
+            egui::Button::new(text)
+                .fill(if selected {
+                    ui.visuals().selection.bg_fill
+                } else {
+                    Color32::TRANSPARENT
+                })
+                .stroke(egui::Stroke::NONE)
+                .wrap_mode(egui::TextWrapMode::Truncate),
+        );
+        // Navigation only from the label button; the native toggle arrow
+        // (rendered by `show_header`) only expands/collapses.
+        if response.clicked() {
+            if let Some(index) = entry.chapter {
+                *chapter_to_set = Some(index);
+            }
+        }
+        response.on_hover_text(&entry.label);
+    });
+
+    if !query.is_empty() {
+        // Search mode: force the tree open without persisting the state.
+        ui.indent(id, |ui| {
+            for child in &entry.children {
+                show_toc_entry(ui, child, query, current_chapter, chapter_to_set);
+            }
+        });
+    } else {
+        header.body(|ui| {
+            for child in &entry.children {
+                show_toc_entry(ui, child, query, current_chapter, chapter_to_set);
+            }
+        });
+    }
+}
+
+/// Renders a TOC leaf as a full-width button, highlighting the current chapter.
+fn show_toc_leaf(
+    ui: &mut egui::Ui,
+    entry: &TocEntry,
+    current_chapter: usize,
+    chapter_to_set: &mut Option<usize>,
+) {
+    let selected = entry.chapter == Some(current_chapter);
+    let text = if selected {
+        egui::RichText::new(&entry.label).color(ui.visuals().selection.stroke.color)
+    } else {
+        egui::RichText::new(&entry.label)
+    };
+    let response = ui.add_sized(
+        [ui.available_width(), 0.0],
+        egui::Button::new(text)
+            .fill(if selected {
+                ui.visuals().selection.bg_fill
+            } else {
+                Color32::TRANSPARENT
+            })
+            .stroke(egui::Stroke::NONE)
+            .wrap_mode(egui::TextWrapMode::Truncate),
+    );
+    if response.clicked() {
+        if let Some(index) = entry.chapter {
+            *chapter_to_set = Some(index);
+        }
+    }
+    response.on_hover_text(&entry.label);
+}
+
 // ─── App state ─────────────────────────────────────────────────────────────
 
 struct EpubApp {
@@ -92,7 +220,6 @@ struct EpubApp {
     status_message: Option<String>,
     status_message_time: Option<std::time::Instant>,
     config: AppConfig,
-    textures: HashMap<String, egui::TextureHandle>,
     loaded_font: String,
     font_loaded: bool,
     /// Path to load on first frame (deferred from startup)
@@ -117,15 +244,12 @@ struct EpubApp {
     /// Flag to scroll conversation to bottom after sending
     conversation_scroll_to_bottom: bool,
     reset_chapter_scroll: bool,
-    chapter_progress_pct: u32,
-    remaining_reading_minutes: u64,
-    remaining_chapter_minutes: u64,
-    search: SearchState,
-    search_enter_pressed: bool,
     /// Background loading task
     loading: Option<LoadingTask>,
-    /// Cached word count per chapter (indexed same as chapters)
-    chapter_word_counts: Vec<usize>,
+    /// Markdown rendering state for the current book
+    markdown_reader: MarkdownReader,
+    /// Whether the epub:// image loader was registered
+    loader_registered: bool,
 }
 
 impl EpubApp {
@@ -143,7 +267,6 @@ impl EpubApp {
             status_message: None,
             status_message_time: None,
             config,
-            textures: HashMap::new(),
             loaded_font: String::new(),
             font_loaded: false,
             pending_startup_load: None,
@@ -157,13 +280,9 @@ impl EpubApp {
             conversation_me_mode: true, // Default to Me mode
             conversation_scroll_to_bottom: false,
             reset_chapter_scroll: false,
-            chapter_progress_pct: 0,
-            remaining_reading_minutes: 0,
-            remaining_chapter_minutes: 0,
-            search: SearchState::default(),
-            search_enter_pressed: false,
             loading: None,
-            chapter_word_counts: Vec::new(),
+            markdown_reader: MarkdownReader::new(),
+            loader_registered: false,
         }
     }
 
@@ -172,7 +291,8 @@ impl EpubApp {
         self.cancel_loading();
         self.document = None;
         self.error_message = None;
-        self.textures.clear();
+        self.loading = None;
+        reader::set_image_source(None);
 
         let path_owned = path.to_string();
         self.current_file_path = Some(path_owned.clone());
@@ -188,7 +308,8 @@ impl EpubApp {
         self.cancel_loading();
         self.document = None;
         self.error_message = None;
-        self.textures.clear();
+        self.loading = None;
+        reader::set_image_source(None);
         self.current_file_path = None;
 
         let cancel = Arc::new(AtomicBool::new(false));
@@ -266,14 +387,8 @@ impl EpubApp {
                         first_chapter_count = doc.chapters.len();
                     }
                     self.document = Some(doc);
-                    self.chapter_word_counts = self
-                        .document
-                        .as_ref()
-                        .unwrap()
-                        .chapters
-                        .iter()
-                        .map(|ch| search_mod::word_count(&ch.segments))
-                        .collect();
+                    reader::set_image_source(Some(self.document.as_ref().unwrap().raw.clone()));
+                    self.markdown_reader.reset();
                 }
                 Ok(Err(e)) => {
                     if e != "Cancelled" {
@@ -322,151 +437,6 @@ impl EpubApp {
         std::process::exit(0);
     }
 
-    fn render_chapter_content(
-        ui: &mut egui::Ui,
-        doc: &LoadedDocument,
-        index: usize,
-        color: Color32,
-        font_size: f32,
-        textures: &mut HashMap<String, egui::TextureHandle>,
-        highlighted_segments: Option<&Vec<ContentSegment>>,
-        chapter_to_set: &mut Option<usize>,
-        search_need_scroll: &mut bool,
-        font_loaded: bool,
-    ) {
-        let chapter = match doc.chapters.get(index) {
-            Some(c) => c,
-            None => return,
-        };
-
-        let segments_to_render = highlighted_segments.unwrap_or(&chapter.segments);
-
-        for segment in segments_to_render {
-            match segment {
-                ContentSegment::StyledText(spans) => {
-                    ui.horizontal_wrapped(|ui| {
-                        for span in spans {
-                            if span.text == "\n" {
-                                ui.end_row();
-                                ui.add_space(4.0);
-                                continue;
-                            }
-
-                            let heading_size = match span.heading_level {
-                                1 => font_size * 1.5,
-                                2 => font_size * 1.25,
-                                3 => font_size * 1.1,
-                                _ => font_size,
-                            };
-
-                            let mut rich = egui::RichText::new(&span.text);
-
-                            if span.bold || span.heading_level > 0 {
-                                rich = rich.strong();
-                            }
-                            if span.italic {
-                                rich = rich.italics();
-                            }
-                            if span.underline {
-                                rich = rich.underline();
-                            }
-                            if let Some([r, g, b, a]) = span.color {
-                                rich = rich.color(Color32::from_rgba_unmultiplied(r, g, b, a));
-                            } else if span.link_url.is_some() {
-                                rich = rich.color(ui.visuals().hyperlink_color);
-                            } else if span.heading_level == 0 {
-                                rich = rich.color(color);
-                            }
-
-                            let font_family = if font_loaded {
-                                fonts::reader_font_family()
-                            } else {
-                                egui::FontFamily::Proportional
-                            };
-                            rich = rich.font(egui::FontId::new(heading_size, font_family));
-
-                            let response =
-                                ui.add(egui::Label::new(rich).sense(if span.link_url.is_some() {
-                                    egui::Sense::click()
-                                } else {
-                                    egui::Sense::hover()
-                                }));
-                            if *search_need_scroll
-                                && span.color == Some(search_mod::ACTIVE_MATCH_COLOR)
-                            {
-                                response.scroll_to_me(Some(egui::Align::Center));
-                                *search_need_scroll = false;
-                            }
-                            if response.clicked() {
-                                if let Some(link) = &span.link_url {
-                                    if link.starts_with("http://")
-                                        || link.starts_with("https://")
-                                        || link.starts_with("mailto:")
-                                    {
-                                        ui.ctx().open_url(egui::OpenUrl::new_tab(link));
-                                    } else {
-                                        let current_href = &chapter.href;
-                                        let base = current_href
-                                            .rsplit_once('/')
-                                            .map_or("", |(directory, _)| directory);
-                                        let target = resolve_path(base, link);
-                                        if let Some(target_index) =
-                                            doc.chapters.iter().position(|candidate| {
-                                                resolve_path("", &candidate.href) == target
-                                            })
-                                        {
-                                            *chapter_to_set = Some(target_index);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    });
-                }
-                ContentSegment::Image { href } => {
-                    if let Some(bytes) = chapter.image_data.get(href) {
-                        if !textures.contains_key(href) {
-                            let img = match image::load_from_memory(bytes) {
-                                Ok(img) => img,
-                                Err(error) => {
-                                    ui.colored_label(
-                                        ui.visuals().error_fg_color,
-                                        format!("[Image decode failed: {}]", error),
-                                    );
-                                    continue;
-                                }
-                            };
-                            let rgba = img.to_rgba8();
-                            let size = [rgba.width() as usize, rgba.height() as usize];
-                            let pixels: Vec<egui::Color32> = rgba
-                                .pixels()
-                                .map(|p| Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]))
-                                .collect();
-                            let color_img = egui::ColorImage { size, pixels };
-                            let handle = ui.ctx().load_texture(
-                                href.clone(),
-                                color_img,
-                                egui::TextureOptions::default(),
-                            );
-                            textures.insert(href.clone(), handle);
-                        }
-
-                        ui.add_space(6.0);
-                        if let Some(handle) = textures.get(href) {
-                            let available = ui.available_width();
-                            ui.add(egui::Image::new(handle).max_width(available));
-                        }
-                        ui.add_space(4.0);
-                    } else if let Some(error) = chapter.image_errors.get(href) {
-                        ui.colored_label(
-                            ui.visuals().error_fg_color,
-                            format!("[{}: {}]", error, href),
-                        );
-                    }
-                }
-            }
-        }
-    }
 }
 
 // ─── GUI ───────────────────────────────────────────────────────────────────
@@ -491,26 +461,14 @@ impl eframe::App for EpubApp {
             self.start_loading_from_path(&path);
         }
 
-        // --- Poll background loading ---
-        let prev_chapter = self.current_chapter;
-        self.poll_loading();
-        if self.current_chapter != prev_chapter {
-            self.search.dirty = true;
+        // --- Register the epub:// image loader once ---
+        if !self.loader_registered {
+            reader::register_image_loader(ctx);
+            self.loader_registered = true;
         }
 
-        // --- Recompute search if needed ---
-        if self.search.show && self.search.dirty {
-            if let Some(ref doc) = self.document {
-                if let Some(chapter) = doc.chapters.get(self.current_chapter) {
-                    let ch_data = ChapterSearchData {
-                        segments: &chapter.segments,
-                    };
-                    search_mod::recompute(&mut self.search, &ch_data);
-                }
-            } else {
-                self.search.dirty = false;
-            }
-        }
+        // --- Poll background loading ---
+        self.poll_loading();
 
         // If a load is in progress, keep repainting so we poll the channel
         if self.loading.is_some() {
@@ -531,7 +489,6 @@ impl eframe::App for EpubApp {
             if i.key_pressed(egui::Key::Escape) {
                 self.show_help = false;
                 self.show_settings = false;
-                self.search.close();
             }
             // if i.key_pressed(egui::Key::ArrowLeft) && self.current_chapter > 0 {
             //     self.current_chapter -= 1;
@@ -547,58 +504,6 @@ impl eframe::App for EpubApp {
             // Ctrl+,: open settings
             if i.modifiers.ctrl && i.key_pressed(egui::Key::Comma) {
                 self.show_settings = !self.show_settings;
-            }
-            // Ctrl+F: open search bar
-            if i.modifiers.ctrl && i.key_pressed(egui::Key::F) {
-                self.search.show = true;
-                if self.search.show {
-                    if let Some(ref doc) = self.document {
-                        if let Some(chapter) = doc.chapters.get(self.current_chapter) {
-                            let ch_data = ChapterSearchData {
-                                segments: &chapter.segments,
-                            };
-                            search_mod::recompute(&mut self.search, &ch_data);
-                        }
-                    }
-                } else {
-                    self.search.clear();
-                }
-            }
-            // Search navigation
-            if self.search.show {
-                let advance = |slf: &mut Self| {
-                    if let Some(ref doc) = slf.document {
-                        if let Some(chapter) = doc.chapters.get(slf.current_chapter) {
-                            let ch_data = ChapterSearchData {
-                                segments: &chapter.segments,
-                            };
-                            slf.search.next_match(&ch_data);
-                        }
-                    }
-                };
-                let go_back = |slf: &mut Self| {
-                    if let Some(ref doc) = slf.document {
-                        if let Some(chapter) = doc.chapters.get(slf.current_chapter) {
-                            let ch_data = ChapterSearchData {
-                                segments: &chapter.segments,
-                            };
-                            slf.search.prev_match(&ch_data);
-                        }
-                    }
-                };
-                // F3: next match, Shift+F3: previous match
-                if i.key_pressed(egui::Key::F3) {
-                    if i.modifiers.shift {
-                        go_back(self);
-                    } else {
-                        advance(self);
-                    }
-                }
-                // Enter: captured here before TextEdit consumes it
-                if i.key_pressed(egui::Key::Enter) {
-                    self.search_enter_pressed = true;
-                }
-
             }
             // Ctrl+R: open recent files
             if i.modifiers.ctrl && i.key_pressed(egui::Key::R) {
@@ -920,7 +825,32 @@ impl eframe::App for EpubApp {
                         ui.separator();
                         let query = self.toc_search.to_lowercase();
                         egui::ScrollArea::vertical().show(ui, |ui| {
-                            for (i, chapter) in doc.chapters.iter().enumerate() {
+                            for entry in &doc.toc {
+                                show_toc_entry(
+                                    ui,
+                                    entry,
+                                    &query,
+                                    self.current_chapter,
+                                    &mut chapter_to_set,
+                                );
+                            }
+
+                            // Spine chapters that are not listed in the TOC tree.
+                            let mut in_tree = HashSet::new();
+                            for entry in &doc.toc {
+                                collect_toc_chapters(entry, &mut in_tree);
+                            }
+                            let tail: Vec<_> = doc
+                                .chapters
+                                .iter()
+                                .enumerate()
+                                .filter(|(i, _)| !in_tree.contains(i))
+                                .collect();
+                            if !tail.is_empty() {
+                                ui.add_space(4.0);
+                                ui.separator();
+                            }
+                            for (i, chapter) in tail {
                                 if !query.is_empty()
                                     && !chapter.label.to_lowercase().contains(&query)
                                 {
@@ -943,6 +873,7 @@ impl eframe::App for EpubApp {
                                 }
                                 response.on_hover_text(&chapter.label);
                             }
+
                             if query.is_empty() && doc.chapters.is_empty() {
                                 ui.label("No chapters found.");
                             } else if !query.is_empty()
@@ -1183,192 +1114,12 @@ impl eframe::App for EpubApp {
                         ui.separator();
                     }
 
-                    // ─── Search bar ──────────────────────────────────────────
-                    if self.search.show {
-                        ui.horizontal(|ui| {
-                            let search_response = ui.add(
-                                egui::TextEdit::singleline(&mut self.search.query)
-                                    .hint_text("Find in chapter...")
-                                    .desired_width(200.0),
-                            );
-                            search_response.request_focus();
-
-                            // Detect search query change
-                            if self.search.query != self.search.last_query {
-                                self.search.dirty = true;
-                                self.search.last_query = self.search.query.clone();
-                            }
-
-                            // Handle Enter: flag set in keyboard handler before TextEdit consumed it
-                            if search_response.lost_focus()
-                                && self.search_enter_pressed
-                            {
-                                self.search_enter_pressed = false;
-                                if let Some(ref doc) = self.document {
-                                    if let Some(chapter) =
-                                        doc.chapters.get(self.current_chapter)
-                                    {
-                                        let ch_data = ChapterSearchData {
-                                            segments: &chapter.segments,
-                                        };
-                                        if ui.input(|i| i.modifiers.shift) {
-                                            self.search.prev_match(&ch_data);
-                                        } else {
-                                            self.search.next_match(&ch_data);
-                                        }
-                                    }
-                                }
-                            }
-
-                            let match_count = self.search.matches.len();
-                            if !self.search.query.is_empty() {
-                                if match_count > 0 {
-                                    ui.label(format!(
-                                        "{}/{}",
-                                        self.search.active + 1,
-                                        match_count
-                                    ));
-                                } else {
-                                    ui.label("0/0");
-                                }
-                            }
-
-                            ui.separator();
-
-                            if ui.button("^").on_hover_text("Previous match").clicked() {
-                                if let Some(ref doc) = self.document {
-                                    if let Some(chapter) =
-                                        doc.chapters.get(self.current_chapter)
-                                    {
-                                        let ch_data = ChapterSearchData {
-                                            segments: &chapter.segments,
-                                        };
-                                        self.search.prev_match(&ch_data);
-                                    }
-                                }
-                            }
-                            if ui.button("v").on_hover_text("Next match").clicked() {
-                                if let Some(ref doc) = self.document {
-                                    if let Some(chapter) =
-                                        doc.chapters.get(self.current_chapter)
-                                    {
-                                        let ch_data = ChapterSearchData {
-                                            segments: &chapter.segments,
-                                        };
-                                        self.search.next_match(&ch_data);
-                                    }
-                                }
-                            }
-
-                            ui.separator();
-
-                            if ui
-                                .checkbox(&mut self.search.highlight_all, "Highlight all")
-                                .changed()
-                            {
-                                if let Some(ref doc) = self.document {
-                                    if let Some(chapter) =
-                                        doc.chapters.get(self.current_chapter)
-                                    {
-                                        let ch_data = ChapterSearchData {
-                                            segments: &chapter.segments,
-                                        };
-                                        self.search.refresh_highlights(&ch_data);
-                                    }
-                                }
-                            }
-                            if ui
-                                .checkbox(&mut self.search.match_case, "Match case")
-                                .changed()
-                            {
-                                self.search.dirty = true;
-                            }
-                            if ui
-                                .checkbox(&mut self.search.whole_words, "Whole words")
-                                .changed()
-                            {
-                                self.search.dirty = true;
-                            }
-
-                            if ui.button("X").on_hover_text("Close search").clicked() {
-                                self.search.close();
-                            }
-                        });
-                        ui.separator();
-                    }
-
-                    // Text box with custom colors
+                    // Markdown reader
                     let font_color = self.config.font_color32();
                     let bg_color = self.config.bg_color32();
-                    let ch_width = self.config.text_width_ch;
-
                     let font_size = self.config.font_size;
-                    let approx_char_width = font_size * 0.55;
-                    let desired_width = ch_width * approx_char_width;
-                    let available = ui.available_width();
-                    let panel_width = available.max(0.0);
-                    let text_box_width = desired_width.min((panel_width - 32.0).max(0.0));
-
-                    let text_align = self.config.text_align.to_egui();
-                    if self.config.show_chapter_progress || self.config.show_reading_time {
-                        egui::TopBottomPanel::bottom("reading_status").show_inside(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if self.config.show_reading_time
-                                            && self.remaining_reading_minutes > 0
-                                        {
-                                            ui.add(
-                                                egui::Label::new(format!(
-                                                    "Book: {}",
-                                                    search_mod::format_reading_time(
-                                                        self.remaining_reading_minutes
-                                                    )
-                                                ))
-                                                .selectable(false),
-                                            );
-                                            ui.separator();
-                                            ui.add(
-                                                egui::Label::new(format!(
-                                                    "Ch: {}",
-                                                    search_mod::format_reading_time(
-                                                        self.remaining_chapter_minutes
-                                                    )
-                                                ))
-                                                .selectable(false),
-                                            );
-                                        }
-                                        if self.config.show_chapter_progress {
-                                            if self.config.show_reading_time
-                                                && self.remaining_reading_minutes > 0
-                                            {
-                                                ui.separator();
-                                            }
-                                            ui.add(
-                                                egui::Label::new(format!(
-                                                    "Chapter progress: {}%",
-                                                    self.chapter_progress_pct
-                                                ))
-                                                .selectable(false),
-                                            );
-                                        }
-                                    },
-                                );
-                            });
-                        });
-                    }
-
-                    let mut chapter_scroll = egui::ScrollArea::vertical()
-                        .id_salt("chapter_text")
-                        .scroll_bar_visibility(
-                            egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
-                        );
-
-                    if self.reset_chapter_scroll {
-                        chapter_scroll = chapter_scroll.scroll_offset(egui::Vec2::ZERO);
-                        self.reset_chapter_scroll = false;
-                    }
+                    let column_width = self.config.text_width_ch * font_size * 0.55;
+                    let align = self.config.text_align.to_egui();
 
                     {
                         let scale = self.config.scroll_speed / 50.0;
@@ -1378,90 +1129,20 @@ impl eframe::App for EpubApp {
                         });
                     }
 
-                    let scroll_output = chapter_scroll.show(ui, |ui| {
-                        ui.add_space(8.0);
-
-                        ui.with_layout(egui::Layout::top_down(text_align), |ui| {
-                            ui.set_width(panel_width);
-                            ui.set_min_width(panel_width);
-                            ui.set_max_width(panel_width);
-                            let frame_response = ui
-                                .allocate_ui_with_layout(
-                                    egui::vec2(text_box_width, 0.0),
-                                    egui::Layout::top_down(text_align),
-                                    |ui| {
-                                        egui::Frame::NONE
-                                            .fill(bg_color)
-                                            .inner_margin(egui::Margin::same(16))
-                                            .corner_radius(egui::CornerRadius::same(4))
-                                            .show(ui, |ui| {
-                                                EpubApp::render_chapter_content(
-                                                    ui,
-                                                    doc,
-                                                    self.current_chapter,
-                                                    font_color,
-                                                    font_size,
-                                                    &mut self.textures,
-                                                    self.search.highlighted_segments.as_ref(),
-                                                    &mut chapter_to_set,
-                                                    &mut self.search.need_scroll,
-                                                    self.font_loaded,
-                                                );
-                                            })
-                                    },
-                                )
-                                .inner;
-                            frame_response.response.context_menu(|ui| {
-                                if ui.button("Copy all text").clicked() {
-                                    let flat = search_mod::build_flat_text(
-                                        &doc.chapters[self.current_chapter].segments,
-                                    );
-                                    ui.ctx().copy_text(flat);
-                                    ui.close_menu();
-                                }
-                            });
-                        });
-
-                        ui.add_space(8.0);
-                    });
-
-                    let content_height = scroll_output.content_size.y;
-                    let viewport_height = scroll_output.inner_rect.height();
-                    self.chapter_progress_pct =
-                        if content_height <= viewport_height || content_height <= f32::EPSILON {
-                            100
-                        } else {
-                            (((scroll_output.state.offset.y + viewport_height) / content_height)
-                                * 100.0)
-                                .round()
-                                .clamp(0.0, 100.0) as u32
-                        };
-
-                    let remaining_words: usize = if self.current_chapter
-                        < self.chapter_word_counts.len()
-                    {
-                        let current_chapter_words = self.chapter_word_counts[self.current_chapter];
-                        let words_done_in_chapter = (current_chapter_words as f64
-                            * (self.chapter_progress_pct as f64 / 100.0))
-                            as usize;
-                        let words_left_in_chapter =
-                            current_chapter_words.saturating_sub(words_done_in_chapter);
-                        let words_in_future_chapters: usize = self
-                            .chapter_word_counts
-                            .get(self.current_chapter + 1..)
-                            .unwrap_or_default()
-                            .iter()
-                            .sum();
-                        self.remaining_chapter_minutes = (words_left_in_chapter as f64
-                            / search_mod::WORDS_PER_MINUTE)
-                            .ceil() as u64;
-                        words_left_in_chapter + words_in_future_chapters
-                    } else {
-                        self.remaining_chapter_minutes = 0;
-                        0
-                    };
-                    self.remaining_reading_minutes =
-                        (remaining_words as f64 / search_mod::WORDS_PER_MINUTE).ceil() as u64;
+                    if let Some(requested) = self.markdown_reader.render(
+                        ui,
+                        doc,
+                        self.current_chapter,
+                        font_size,
+                        font_color,
+                        bg_color,
+                        column_width,
+                        align,
+                        self.font_loaded,
+                        &mut self.reset_chapter_scroll,
+                    ) {
+                        chapter_to_set = Some(requested);
+                    }
                 });
             });
         } else {

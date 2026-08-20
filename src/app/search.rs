@@ -1,3 +1,4 @@
+#![allow(dead_code)] // Reimplemented on markdown; kept for the upcoming rewrite.
 use std::collections::HashMap;
 
 use epubthing::{ContentSegment, StyledSpan};

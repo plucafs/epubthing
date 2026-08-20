@@ -33,23 +33,6 @@ pub fn show(ctx: &egui::Context, show: &mut bool, config: &mut AppConfig, config
                         *config_dirty = true;
                     }
 
-                    if ui
-                        .checkbox(
-                            &mut config.show_chapter_progress,
-                            "Show chapter reading progress",
-                        )
-                        .changed()
-                    {
-                        *config_dirty = true;
-                    }
-
-                    if ui
-                        .checkbox(&mut config.show_reading_time, "Show estimated reading time")
-                        .changed()
-                    {
-                        *config_dirty = true;
-                    }
-
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.label("UI Scale:");
@@ -216,8 +199,6 @@ pub fn show(ctx: &egui::Context, show: &mut bool, config: &mut AppConfig, config
                         config.text_align = defaults.text_align;
                         config.scroll_speed = defaults.scroll_speed;
                         config.save_reading_position = defaults.save_reading_position;
-                        config.show_chapter_progress = defaults.show_chapter_progress;
-                        config.show_reading_time = defaults.show_reading_time;
                         *config_dirty = true;
                     }
                 });

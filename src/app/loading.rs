@@ -1,24 +1,38 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 
-use epubthing::{ContentSegment, EpubDocument, StyledSpan};
+use epubthing::TocItem;
+use epubthing::{resolve_path, EpubDocument};
 
 /// A chapter loaded into memory for rendering.
 #[derive(Clone)]
 pub struct Chapter {
     pub label: String,
     pub href: String,
-    pub segments: Vec<ContentSegment>,
-    pub image_data: HashMap<String, Vec<u8>>,
-    pub image_errors: HashMap<String, String>,
+    /// Raw chapter HTML, converted to Markdown for rendering.
+    pub html: String,
+}
+
+/// One entry of the TOC sidebar tree.
+#[derive(Clone)]
+pub struct TocEntry {
+    pub label: String,
+    pub href: String,
+    /// Index into `LoadedDocument::chapters`, when this entry maps to a spine item.
+    pub chapter: Option<usize>,
+    pub children: Vec<TocEntry>,
 }
 
 /// A fully loaded EPUB document ready for display.
 pub struct LoadedDocument {
     pub title: String,
     pub author: String,
+    /// The underlying archive, kept alive for runtime asset access.
+    pub raw: Arc<Mutex<EpubDocument>>,
     pub chapters: Vec<Chapter>,
+    /// Nested table of contents for the sidebar tree.
+    pub toc: Vec<TocEntry>,
 }
 
 /// State for a background loading task.
@@ -40,57 +54,39 @@ fn build_chapter(
     href: &str,
     label: String,
 ) -> Result<Chapter, String> {
-    match doc.get_content_segments(href) {
-        Ok(segments) => {
-            let mut image_data = HashMap::new();
-            let mut image_errors = HashMap::new();
-            for seg in &segments {
-                if let ContentSegment::Image { href: img_href } = seg {
-                    match doc.get_image_bytes(img_href) {
-                        Ok(bytes) => {
-                            if let Err(error) = image::load_from_memory(&bytes) {
-                                image_errors.insert(
-                                    img_href.clone(),
-                                    format!("Image decode failed: {}", error),
-                                );
-                            } else {
-                                image_data.insert(img_href.clone(), bytes);
-                            }
-                        }
-                        Err(error) => {
-                            image_errors.insert(img_href.clone(), error.to_string());
-                        }
-                    }
-                }
-            }
-            Ok(Chapter {
-                label,
-                href: href.to_string(),
-                segments,
-                image_data,
-                image_errors,
-            })
-        }
-        Err(e) => Ok(Chapter {
-            label,
-            href: href.to_string(),
-            segments: vec![ContentSegment::StyledText(vec![StyledSpan {
-                text: format!("[Error: {}]", e),
-                bold: false,
-                italic: false,
-                underline: false,
-                heading_level: 0,
-                link_url: None,
-                color: None,
-            }])],
-            image_data: HashMap::new(),
-            image_errors: HashMap::new(),
-        }),
+    let html = doc
+        .get_content(href)
+        .map_err(|e| format!("Error loading {}: {}", href, e))?;
+    Ok(Chapter {
+        label,
+        href: href.to_string(),
+        html,
+    })
+}
+
+/// Builds the sidebar tree by resolving each TOC href to a spine chapter index.
+fn map_toc_entries(items: &[TocItem], chapter_by_href: &HashMap<String, usize>) -> Vec<TocEntry> {
+    items
+        .iter()
+        .map(|item| TocEntry {
+            label: item.label.clone(),
+            href: item.href.clone(),
+            chapter: chapter_by_href.get(&resolve_path("", &item.href)).copied(),
+            children: map_toc_entries(&item.children, chapter_by_href),
+        })
+        .collect()
+}
+
+/// Collects the first label found for each resolved TOC href.
+fn toc_label_map(items: &[TocItem], out: &mut HashMap<String, String>) {
+    for item in items {
+        out.entry(resolve_path("", &item.href))
+            .or_insert_with(|| item.label.clone());
+        toc_label_map(&item.children, out);
     }
 }
 
-/// Loads an EPUB incrementally: parses the first chapter immediately and sends
-/// a partial result, then parses the remaining chapters and sends the full document.
+/// Loads an EPUB, then sends the full document once all chapters are parsed.
 fn load_incremental(
     mut doc: EpubDocument,
     cancel: &AtomicBool,
@@ -108,80 +104,55 @@ fn load_incremental(
         .iter()
         .map(|s| (s.href.clone(), s.id.clone()))
         .collect();
-    let toc_len = doc.toc.len();
 
     if spine.is_empty() {
         let _ = tx.send(Err("EPUB has no content".into()));
         return;
     }
 
-    // ── Phase 1: parse only the first chapter ──
-    if cancel.load(Ordering::SeqCst) {
-        let _ = tx.send(Err("Cancelled".into()));
-        return;
-    }
+    let chapter_by_href: HashMap<String, usize> = spine
+        .iter()
+        .enumerate()
+        .map(|(i, (href, _))| (resolve_path("", href), i))
+        .collect();
+    let chapter_resolved: Vec<String> =
+        spine.iter().map(|(href, _)| resolve_path("", href)).collect();
+    let mut labels = HashMap::new();
+    toc_label_map(&doc.toc, &mut labels);
 
-    let first_label = if toc_len > 0 {
-        doc.toc[0].label.clone()
-    } else {
-        "Chapter 1".into()
-    };
+    let mut chapters = Vec::with_capacity(spine.len());
 
-    let first_chapter = match build_chapter(&mut doc, &spine[0].0, first_label) {
-        Ok(ch) => ch,
-        Err(e) => {
-            let _ = tx.send(Err(e));
-            return;
-        }
-    };
-
-    let _ = tx.send(Ok(LoadedDocument {
-        title: title.clone(),
-        author: author.clone(),
-        chapters: vec![first_chapter.clone()],
-    }));
-
-    // ── Phase 2: parse remaining chapters ──
-    let mut chapters: Vec<Chapter> = vec![first_chapter];
-
-    for (i, (href, _id)) in spine.iter().enumerate().skip(1) {
+    for (i, (href, _id)) in spine.iter().enumerate() {
         if cancel.load(Ordering::SeqCst) {
             let _ = tx.send(Err("Cancelled".into()));
             return;
         }
 
-        let label = if i < toc_len {
-            doc.toc[i].label.clone()
-        } else {
-            format!("Chapter {}", i + 1)
-        };
+        let label = labels
+            .get(&chapter_resolved[i])
+            .cloned()
+            .unwrap_or_else(|| format!("Chapter {}", i + 1));
 
         let ch = match build_chapter(&mut doc, href, label) {
             Ok(ch) => ch,
             Err(_e) => Chapter {
                 label: format!("Chapter {}", i + 1),
                 href: href.clone(),
-                segments: vec![ContentSegment::StyledText(vec![StyledSpan {
-                    text: "[Error loading chapter]".into(),
-                    bold: false,
-                    italic: false,
-                    underline: false,
-                    heading_level: 0,
-                    link_url: None,
-                    color: None,
-                }])],
-                image_data: HashMap::new(),
-                image_errors: HashMap::new(),
+                html: "[Error loading chapter]".into(),
             },
         };
 
         chapters.push(ch);
     }
 
+    let toc = map_toc_entries(&doc.toc, &chapter_by_href);
+
     let _ = tx.send(Ok(LoadedDocument {
         title,
         author,
+        raw: Arc::new(Mutex::new(doc)),
         chapters,
+        toc,
     }));
 }
 
@@ -239,5 +210,60 @@ pub fn start_loading_from_bytes(name: &str, bytes: Vec<u8>, cancel: Arc<AtomicBo
         status,
         cancel,
         receiver: rx,
+    }
+}
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use epubthing::TocItem;
+    use epubthing::resolve_path;
+
+    use super::{map_toc_entries, toc_label_map};
+
+    fn item(label: &str, href: &str, children: Vec<TocItem>) -> TocItem {
+        TocItem {
+            label: label.to_string(),
+            href: href.to_string(),
+            children,
+        }
+    }
+
+    #[test]
+    fn label_map_prefers_first_label_per_href() {
+        let toc = vec![item(
+            "Moby Dick",
+            "text/halftitlepage.xhtml",
+            vec![item("I: Loomings", "text/chapter-1.xhtml", vec![])],
+        )];
+        let mut map = HashMap::new();
+        toc_label_map(&toc, &mut map);
+        assert_eq!(
+            map.get("text/halftitlepage.xhtml").map(|s| s.as_str()),
+            Some("Moby Dick")
+        );
+        assert_eq!(
+            map.get("text/chapter-1.xhtml").map(|s| s.as_str()),
+            Some("I: Loomings")
+        );
+    }
+
+    #[test]
+    fn maps_toc_hrefs_to_chapter_indexes() {
+        let toc = vec![item(
+            "Moby Dick",
+            "text/halftitlepage.xhtml",
+            vec![item("I: Loomings", "text/chapter-1.xhtml", vec![])],
+        )];
+        let mut by_href: HashMap<String, usize> = HashMap::new();
+        by_href.insert(resolve_path("", "text/halftitlepage.xhtml"), 2);
+        by_href.insert(resolve_path("", "text/chapter-1.xhtml"), 3);
+
+        let entries = map_toc_entries(&toc, &by_href);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].label, "Moby Dick");
+        assert_eq!(entries[0].chapter, Some(2));
+        assert_eq!(entries[0].children[0].label, "I: Loomings");
+        assert_eq!(entries[0].children[0].chapter, Some(3));
     }
 }

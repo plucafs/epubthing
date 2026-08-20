@@ -3,7 +3,7 @@ use std::io::Read;
 use zip::read::ZipArchive;
 
 use crate::html::{parse_html_segments, resolve_path, strip_html};
-use crate::ncx::{extract_toc_from_spine, find_ncx_href, parse_ncx};
+use crate::ncx::{extract_toc_from_spine, find_nav_href, find_ncx_href, parse_nav_html, parse_ncx};
 use crate::opf::{parse_container, parse_opf};
 use crate::types::{ContentSegment, Metadata, SpineItem, TocItem};
 
@@ -56,13 +56,36 @@ impl EpubDocument {
 
         let (metadata, spine) = parse_opf(&opf_content)?;
 
-        let ncx_href = find_ncx_href(&opf_content);
-        let toc = if let Some(ncx_path) = ncx_href {
+        // Prefer the NCX (EPUB2) for chapter titles, then the EPUB3 nav
+        // document, then fall back to spine ids.
+        let toc = if let Some(ncx_path) = find_ncx_href(&opf_content) {
             let full_ncx = resolve_path(&opf_dir, &ncx_path);
             if let Ok(mut f) = archive.by_name(&full_ncx) {
                 let mut ncx_xml = String::new();
                 if f.read_to_string(&mut ncx_xml).is_ok() {
-                    parse_ncx(&ncx_xml)
+                    let items = parse_ncx(&ncx_xml);
+                    if !items.is_empty() {
+                        items
+                    } else {
+                        extract_toc_from_spine(&spine)
+                    }
+                } else {
+                    extract_toc_from_spine(&spine)
+                }
+            } else {
+                extract_toc_from_spine(&spine)
+            }
+        } else if let Some(nav_path) = find_nav_href(&opf_content) {
+            let full_nav = resolve_path(&opf_dir, &nav_path);
+            if let Ok(mut f) = archive.by_name(&full_nav) {
+                let mut nav_html = String::new();
+                if f.read_to_string(&mut nav_html).is_ok() {
+                    let items = parse_nav_html(&nav_html);
+                    if !items.is_empty() {
+                        items
+                    } else {
+                        extract_toc_from_spine(&spine)
+                    }
                 } else {
                     extract_toc_from_spine(&spine)
                 }

@@ -10,6 +10,7 @@ pub enum TextAlign {
 }
 
 impl TextAlign {
+    #[allow(dead_code)] // Column alignment will be restored with the markdown reader.
     pub fn to_egui(&self) -> egui::Align {
         match self {
             TextAlign::Left => egui::Align::LEFT,

@@ -103,6 +103,8 @@ pub(crate) struct OpfManifestItem {
     pub(crate) href: String,
     #[serde(rename = "@media-type")]
     pub(crate) media_type: Option<String>,
+    #[serde(rename = "@properties")]
+    pub(crate) properties: Option<String>,
 }
 
 pub(crate) fn parse_opf(xml: &str) -> Result<(Metadata, Vec<SpineItem>)> {
