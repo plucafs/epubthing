@@ -134,7 +134,19 @@ fn load_incremental(
             .unwrap_or_else(|| format!("Chapter {}", i + 1));
 
         let ch = match build_chapter(&mut doc, href, label) {
-            Ok(ch) => ch,
+            Ok(ch) => {
+                // Spine chapters the book's own TOC never references keep a
+                // placeholder label; give them a real title from their HTML.
+                if ch.label.starts_with("Chapter ") {
+                    if let Some(title) = epubthing::first_heading_text(&ch.html) {
+                        Chapter { label: title, ..ch }
+                    } else {
+                        ch
+                    }
+                } else {
+                    ch
+                }
+            }
             Err(_e) => Chapter {
                 label: format!("Chapter {}", i + 1),
                 href: href.clone(),

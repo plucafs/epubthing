@@ -166,6 +166,14 @@ pub fn show(ctx: &egui::Context, show: &mut bool, config: &mut AppConfig, config
                     }
 
                     ui.add_space(4.0);
+                    if ui
+                        .checkbox(&mut config.show_minimap, "Show scroll minimap")
+                        .changed()
+                    {
+                        *config_dirty = true;
+                    }
+
+                    ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.label("Font color:");
                         let mut c = config.font_color32();
@@ -199,6 +207,7 @@ pub fn show(ctx: &egui::Context, show: &mut bool, config: &mut AppConfig, config
                         config.text_align = defaults.text_align;
                         config.scroll_speed = defaults.scroll_speed;
                         config.save_reading_position = defaults.save_reading_position;
+                        config.show_minimap = defaults.show_minimap;
                         *config_dirty = true;
                     }
                 });

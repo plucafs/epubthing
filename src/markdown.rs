@@ -55,11 +55,18 @@ pub fn strip_raw_html(markdown: &str) -> String {
 /// internal (chapter) link targets ready for link hooks.
 ///
 /// Returns `(markdown, targets)` where each target is `(link, chapter_index)`
-/// with `chapter_index` pointing into `chapter_hrefs`.
+/// with `chapter_index` pointing into `chapter_hrefs`. Internal links that do
+/// not resolve to a spine chapter are still hooked (to `current_index`) so the
+/// reader never falls back to an external-hyperlink render for relative URLs.
+/// Links whose visible text exceeds `MAX_LINK_TEXT` characters are flattened to
+/// plain text so a long paragraph cannot become one giant clickable block.
+pub const MAX_LINK_TEXT: usize = 200;
+
 pub fn rewrite_links_and_images(
     markdown: &str,
     base: &str,
     chapter_hrefs: &[String],
+    current_index: usize,
 ) -> (String, Vec<(String, usize)>) {
     let mut out = String::with_capacity(markdown.len());
     let mut targets = Vec::new();
@@ -97,6 +104,17 @@ pub fn rewrite_links_and_images(
                 let target_raw: String = chars[j + 2..k - 1].iter().collect();
                 let target = target_raw.trim();
 
+                let label: String = chars[i + 1..j].iter().collect();
+
+                // Bug 6: a long link text would render as one huge clickable
+                // block (typical of anchors wrapping whole paragraphs).
+                // Flatten it to plain text and skip the link entirely.
+                if is_link && label.chars().count() > MAX_LINK_TEXT {
+                    out.push_str(&label);
+                    i = k;
+                    continue;
+                }
+
                 let rewritten = if is_image
                     && !target.starts_with("http")
                     && !target.starts_with("data:")
@@ -110,9 +128,11 @@ pub fn rewrite_links_and_images(
                 {
                     let path = target.split('#').next().unwrap_or(target);
                     let resolved = crate::resolve_path(base, path);
-                    if let Some(idx) = chapter_hrefs.iter().position(|h| *h == resolved) {
-                        targets.push((target.to_string(), idx));
-                    }
+                    let idx = chapter_hrefs.iter().position(|h| *h == resolved);
+                    // Hook every internal link: spine chapters navigate, and
+                    // anything else (same-file `#anchor`, out-of-spine paths) is
+                    // still swallowed so no dead external-hyperlink is rendered.
+                    targets.push((target.to_string(), idx.unwrap_or(current_index)));
                     None
                 } else {
                     None
@@ -140,12 +160,108 @@ pub fn rewrite_links_and_images(
 pub fn heal_markdown(markdown: &str) -> String {
     let mut out = String::new();
     for line in markdown.lines() {
-        if looks_like_prose(line) {
+        if let Some(cleaned) = strip_alert_token(line) {
+            out.push_str(&cleaned);
+        } else if is_heading_line(line) {
+            out.push_str(&trim_heading_asterisks(line));
+        } else if looks_like_prose(line) {
             out.push_str(&fix_spaced_chars(&remove_definition_separators(line)));
         } else {
             out.push_str(line);
         }
         out.push('\n');
+    }
+    out
+}
+
+/// GitHub-flavoured admonition tokens (`> [!WARNING]`) that some EPUBs carry
+/// into blockquotes. The reader renders quotes as plain quotes, so the token
+/// itself is dropped to avoid leaking "[!WARNING]" into the text.
+fn strip_alert_token(line: &str) -> Option<String> {
+    let rest = line.split_once('>')?.1.trim_start();
+    if !rest.starts_with("[!") {
+        return None;
+    }
+    let ident_end = rest.find(']')?;
+    let ident = rest[2..ident_end].to_ascii_uppercase();
+    const ALERT_IDENTS: [&str; 5] = ["NOTE", "TIP", "IMPORTANT", "WARNING", "CAUTION"];
+    if !ALERT_IDENTS.contains(&ident.as_str()) {
+        return None;
+    }
+    Some(format!("> {}", rest[ident_end + 1..].trim_start()))
+}
+
+fn is_heading_line(line: &str) -> bool {
+    let mut count = 0;
+    for c in line.chars() {
+        if c == '#' {
+            count += 1;
+            if count > 6 {
+                return false;
+            }
+        } else {
+            return count > 0 && c == ' ';
+        }
+    }
+    count > 0
+}
+
+/// Removes any leading blank, whitespace-only or `\u{a0}` lines that `mdka`
+/// can emit before the first real content of a chapter (left-overs from
+/// stripped `<a id>` anchors and block-level wrappers).
+pub fn trim_leading_blank_lines(markdown: &str) -> String {
+    let mut start = 0;
+    for (idx, c) in markdown.char_indices() {
+        if c == '\n' {
+            // Every char seen so far was blank, so drop the whole line.
+            start = idx + 1;
+        } else if c.is_whitespace() || c == '\u{a0}' {
+            // Still inside a (possibly) blank prefix line.
+        } else {
+            break;
+        }
+    }
+    if start == 0 {
+        markdown.to_owned()
+    } else {
+        markdown[start..].to_owned()
+    }
+}
+
+/// Removes runs of four or more asterisks at the start and end of a heading's
+/// content. Such runs are invalid Markdown emphasis (valid emphasis is 2-3
+/// asterisks) and are produced when `mdka` nests empty `<strong>`/`<em>`
+/// elements inside a heading, rendering as a spurious `******` prefix.
+fn trim_heading_asterisks(line: &str) -> String {
+    let (hashes, content) = line
+        .find(' ')
+        .map(|i| (&line[..i], line[i + 1..].trim_start()))
+        .unwrap_or((line, ""));
+
+    let mut content = content.to_owned();
+    loop {
+        let leading = content.chars().take_while(|c| *c == '*').count();
+        if leading >= 4 {
+            content = content[leading..].trim_start().to_owned();
+        } else {
+            break;
+        }
+    }
+    loop {
+        let trailing = content.chars().rev().take_while(|c| *c == '*').count();
+        if trailing >= 4 {
+            let keep = content.chars().count() - trailing;
+            content = content.chars().take(keep).collect::<String>();
+        } else {
+            break;
+        }
+    }
+
+    let mut out = String::with_capacity(line.len());
+    out.push_str(hashes);
+    if !content.is_empty() {
+        out.push(' ');
+        out.push_str(content.trim_end());
     }
     out
 }
@@ -218,8 +334,44 @@ fn remove_definition_separators(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{heal_markdown, rewrite_links_and_images, strip_raw_html};
+    use super::{heal_markdown, rewrite_links_and_images, strip_raw_html, trim_leading_blank_lines};
     use crate::EpubDocument;
+
+    #[test]
+    fn trims_leading_blank_lines() {
+        assert_eq!(trim_leading_blank_lines("\n\n## Title\n\nBody\n"), "## Title\n\nBody\n");
+    }
+
+    #[test]
+    fn trims_whitespace_only_and_nbsp_prefix_lines() {
+        let md = " \t\n\u{a0}\u{a0}\n# Heading\n\nText\n";
+        assert_eq!(trim_leading_blank_lines(md), "# Heading\n\nText\n");
+    }
+
+    #[test]
+    fn keeps_leading_content_and_trailing_structure() {
+        let md = "starts with text\n\nBody\n";
+        assert_eq!(trim_leading_blank_lines(md), md);
+        let md = "\n# Title\n";
+        assert_eq!(trim_leading_blank_lines(md), "# Title\n");
+    }
+
+    #[test]
+    fn strips_github_alert_tokens_from_quotes() {
+        let md = "> [!WARNING]\n> Attenzione: something bad.\n\n> [!NOTE] A normal note.\n\n> plain quote\n";
+        let healed = heal_markdown(md);
+        assert!(healed.contains("> Attenzione: something bad."), "{healed}");
+        assert!(healed.contains("> A normal note."), "{healed}");
+        assert!(!healed.contains("[!"), "{healed}");
+        assert!(healed.contains("> plain quote"), "{healed}");
+    }
+
+    #[test]
+    fn keeps_non_alert_quotes_and_unknown_tokens() {
+        let md = "> [!THING] not an alert\n";
+        let healed = heal_markdown(md);
+        assert_eq!(healed, md);
+    }
 
     #[test]
     fn strips_id_only_anchors() {
@@ -234,7 +386,7 @@ mod tests {
     fn rewrites_images_to_epub_scheme_and_resolves() {
         let md = "# T\n\n![log](../images/logo.png)\n\n[Home](chapter-1.xhtml#top)\n\n[web](https://example.com/)\n";
         let chapter_hrefs = vec!["text/chapter-1.xhtml".to_string()];
-        let (out, targets) = rewrite_links_and_images(md, "text", &chapter_hrefs);
+        let (out, targets) = rewrite_links_and_images(md, "text", &chapter_hrefs, 0);
         assert!(out.contains("epub://images/logo.png"), "{out}");
         assert!(out.contains("https://example.com/"), "{out}");
         assert_eq!(targets.len(), 1);
@@ -259,10 +411,41 @@ mod tests {
             "<a id=\"endnotes\"></a>\n\n## Endnotes\n\n1. <a id=\"note-1\"></a>\n\nText. [↩](chapter-24.xhtml#noteref-1)\n",
         );
         let (out, targets) =
-            rewrite_links_and_images(&md, "text", &["text/chapter-24.xhtml".to_string()]);
+            rewrite_links_and_images(&md, "text", &["text/chapter-24.xhtml".to_string()], 0);
         assert!(!out.contains("<a "));
         assert!(out.contains("1."), "{out}");
         assert!(targets.iter().any(|(t, i)| t == "chapter-24.xhtml#noteref-1" && *i == 0));
+    }
+
+    #[test]
+    fn out_of_spine_link_is_hooked_to_current_chapter() {
+        let md = "See [note 1](#note-1) and [again](missing.xhtml).\n";
+        let (out, targets) = rewrite_links_and_images(md, "text", &[], 7);
+        // no dead external hyperlinks are left in place
+        assert_eq!(out, md);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0], ("#note-1".to_string(), 7));
+        assert_eq!(targets[1], ("missing.xhtml".to_string(), 7));
+    }
+
+    #[test]
+    fn long_link_text_is_flattened_to_plain_text() {
+        let long = "x".repeat(300);
+        let md = format!("Some intro [{}](missing.xhtml) more.\n", long);
+        let (out, targets) = rewrite_links_and_images(&md, "text", &[], 0);
+        assert!(!out.contains("["), "{out}");
+        assert!(!out.contains("missing.xhtml"), "{out}");
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn heading_asterisk_runs_are_trimmed() {
+        let md = "## ******Moby Dick\n\n### Some **** title **\n\n# **Valid bold**\n";
+        let healed = heal_markdown(md);
+        assert_eq!(
+            healed,
+            "## Moby Dick\n\n### Some **** title **\n\n# **Valid bold**\n"
+        );
     }
 
     #[test]
@@ -299,7 +482,7 @@ mod tests {
             let md = mdka::html_to_markdown(&html);
             let md = strip_raw_html(&md);
             let md = heal_markdown(&md);
-            let (out, targets) = rewrite_links_and_images(&md, base, &chapter_hrefs);
+            let (out, targets) = rewrite_links_and_images(&md, base, &chapter_hrefs, 0);
 
             assert!(!out.contains('<'), "raw html survived in {:?}", ch.href);
 

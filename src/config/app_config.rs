@@ -30,6 +30,8 @@ pub struct AppConfig {
     pub show_chapter_progress: bool,
     #[serde(default = "default_true")]
     pub show_reading_time: bool,
+    #[serde(default = "default_true")]
+    pub show_minimap: bool,
     #[serde(default = "default_scroll_speed")]
     pub scroll_speed: f32,
     #[serde(default)]
@@ -69,6 +71,7 @@ impl Default for AppConfig {
             save_reading_position: true,
             show_chapter_progress: true,
             show_reading_time: true,
+            show_minimap: true,
             scroll_speed: default_scroll_speed(),
             reading_positions: HashMap::new(),
         }

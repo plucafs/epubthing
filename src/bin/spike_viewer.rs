@@ -183,7 +183,7 @@ impl SpikeApp {
             .map(|c| epubthing::resolve_path("", &c.href))
             .collect();
 
-        let (md, targets) = rewrite_links_and_images(&md, base, &chapter_hrefs);
+        let (md, targets) = rewrite_links_and_images(&md, base, &chapter_hrefs, self.current);
         self.markdown = md;
         self.link_targets = targets;
 
@@ -343,6 +343,7 @@ fn rewrite_links_and_images(
     markdown: &str,
     base: &str,
     chapter_hrefs: &[String],
+    current_index: usize,
 ) -> (String, Vec<(String, usize)>) {
     let mut out = String::with_capacity(markdown.len());
     let mut targets = Vec::new();
@@ -393,9 +394,8 @@ fn rewrite_links_and_images(
                 {
                     let path = target.split('#').next().unwrap_or(target);
                     let resolved = epubthing::resolve_path(base, path);
-                    if let Some(idx) = chapter_hrefs.iter().position(|h| *h == resolved) {
-                        targets.push((target.to_string(), idx));
-                    }
+                    let idx = chapter_hrefs.iter().position(|h| *h == resolved);
+                    targets.push((target.to_string(), idx.unwrap_or(current_index)));
                     None
                 } else {
                     None
@@ -560,7 +560,7 @@ mod tests {
     fn rewrites_images_to_epub_scheme_and_resolves() {
         let md = "# T\n\n![log](../images/logo.png)\n\n[Home](chapter-1.xhtml#top)\n\n[web](https://example.com/)\n";
         let chapter_hrefs = vec!["text/chapter-1.xhtml".to_string()];
-        let (out, targets) = rewrite_links_and_images(md, "text", &chapter_hrefs);
+        let (out, targets) = rewrite_links_and_images(md, "text", &chapter_hrefs, 0);
         assert!(out.contains("epub://images/logo.png"), "{out}");
         assert!(out.contains("https://example.com/"), "{out}");
         assert_eq!(targets.len(), 1);
@@ -584,7 +584,7 @@ mod tests {
         let md = strip_raw_html(
             "<a id=\"endnotes\"></a>\n\n## Endnotes\n\n1. <a id=\"note-1\"></a>\n\nText. [↩](chapter-24.xhtml#noteref-1)\n",
         );
-        let (out, targets) = rewrite_links_and_images(&md, "text", &["text/chapter-24.xhtml".to_string()]);
+        let (out, targets) = rewrite_links_and_images(&md, "text", &["text/chapter-24.xhtml".to_string()], 0);
         assert!(!out.contains("<a "));
         assert!(out.contains("1."), "{out}");
         assert!(targets.iter().any(|(t, i)| t == "chapter-24.xhtml#noteref-1" && *i == 0));
@@ -607,7 +607,7 @@ mod tests {
             let md = mdka::html_to_markdown(&html);
             let md = strip_raw_html(&md);
             let md = heal_markdown(&md);
-            let (out, targets) = rewrite_links_and_images(&md, base, &chapter_hrefs);
+            let (out, targets) = rewrite_links_and_images(&md, base, &chapter_hrefs, 0);
 
             assert!(!out.contains('<'), "raw html survived in {:?}", ch.href);
 

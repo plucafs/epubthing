@@ -98,6 +98,17 @@ fn collect_toc_chapters(entry: &TocEntry, out: &mut HashSet<usize>) {
     }
 }
 
+/// Flattens the TOC tree into `(label, chapter_index)` pairs in depth-first
+/// order, for the Ctrl+G TOC window.
+fn collect_toc_flat(entries: &[TocEntry], out: &mut Vec<(String, usize)>) {
+    for entry in entries {
+        if let Some(index) = entry.chapter {
+            out.push((entry.label.clone(), index));
+        }
+        collect_toc_flat(&entry.children, out);
+    }
+}
+
 /// Renders one TOC entry: a clickable leaf or a collapsible container.
 fn show_toc_entry(
     ui: &mut egui::Ui,
@@ -137,8 +148,11 @@ fn show_toc_entry(
 
     let header = state.show_header(ui, |ui| {
         let width = ui.available_width().max(0.0);
+        // Match the row height to a standard interactive row so the native
+        // collapse arrow centers vertically against the label button.
+        let row_height = ui.spacing().interact_size.y;
         let response = ui.add_sized(
-            [width, 0.0],
+            [width, row_height],
             egui::Button::new(text)
                 .fill(if selected {
                     ui.visuals().selection.bg_fill
@@ -236,6 +250,20 @@ struct EpubApp {
     recent_search: String,
     /// Current selection index in the filtered recent files list
     recent_selection: usize,
+    /// Focus the recent-files search field on the next frame
+    recent_needs_focus: bool,
+    /// Scroll the recent-files list to the selected row on the next frame
+    recent_scroll_to_sel: bool,
+    /// Whether the TOC window (Ctrl+G) is open
+    show_toc_window: bool,
+    /// Search filter for the TOC window
+    toc_window_search: String,
+    /// Current selection index in the filtered TOC window list
+    toc_window_selection: usize,
+    /// Focus the TOC window search field on the next frame
+    toc_window_needs_focus: bool,
+    /// Scroll the TOC window list to the selected row on the next frame
+    toc_window_scroll_to_sel: bool,
     // --- Conversation ---
     conversation_messages: Vec<ConversationMessage>,
     conversation_input: String,
@@ -275,6 +303,13 @@ impl EpubApp {
             show_recent: false,
             recent_search: String::new(),
             recent_selection: 0,
+            recent_needs_focus: false,
+            recent_scroll_to_sel: false,
+            show_toc_window: false,
+            toc_window_search: String::new(),
+            toc_window_selection: 0,
+            toc_window_needs_focus: false,
+            toc_window_scroll_to_sel: false,
             conversation_messages: Vec::new(),
             conversation_input: String::new(),
             conversation_me_mode: true, // Default to Me mode
@@ -336,6 +371,24 @@ impl EpubApp {
     fn remove_from_recent_files(&mut self, path: &str) {
         self.config.recent_files.retain(|p| p != path);
         save_config(&self.config);
+    }
+
+    /// Opens the recent files dialog and focuses the search field.
+    fn open_recent_files(&mut self) {
+        self.show_recent = true;
+        self.recent_search.clear();
+        self.recent_selection = 0;
+        self.recent_needs_focus = true;
+        self.recent_scroll_to_sel = false;
+    }
+
+    /// Opens the TOC window and focuses its search field.
+    fn open_toc_window(&mut self) {
+        self.show_toc_window = true;
+        self.toc_window_search.clear();
+        self.toc_window_selection = 0;
+        self.toc_window_needs_focus = true;
+        self.toc_window_scroll_to_sel = false;
     }
 
     /// Sets the current chapter and saves the reading position.
@@ -489,6 +542,7 @@ impl eframe::App for EpubApp {
             if i.key_pressed(egui::Key::Escape) {
                 self.show_help = false;
                 self.show_settings = false;
+                self.show_recent = false;
             }
             // if i.key_pressed(egui::Key::ArrowLeft) && self.current_chapter > 0 {
             //     self.current_chapter -= 1;
@@ -507,9 +561,19 @@ impl eframe::App for EpubApp {
             }
             // Ctrl+R: open recent files
             if i.modifiers.ctrl && i.key_pressed(egui::Key::R) {
-                self.show_recent = !self.show_recent;
-                self.recent_search.clear();
-                self.recent_selection = 0;
+                if self.show_recent {
+                    self.show_recent = false;
+                } else {
+                    self.open_recent_files();
+                }
+            }
+            // Ctrl+G: open the TOC window
+            if i.modifiers.ctrl && i.key_pressed(egui::Key::G) {
+                if self.show_toc_window {
+                    self.show_toc_window = false;
+                } else {
+                    self.open_toc_window();
+                }
             }
             // Ctrl+Shift+C: toggle conversation panel
             if i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::C) {
@@ -530,9 +594,22 @@ impl eframe::App for EpubApp {
             if self.show_recent {
                 if i.key_pressed(egui::Key::ArrowDown) {
                     self.recent_selection = self.recent_selection.saturating_add(1);
+                    self.recent_scroll_to_sel = true;
                 }
                 if i.key_pressed(egui::Key::ArrowUp) {
                     self.recent_selection = self.recent_selection.saturating_sub(1);
+                    self.recent_scroll_to_sel = true;
+                }
+            }
+            // TOC window navigation
+            if self.show_toc_window {
+                if i.key_pressed(egui::Key::ArrowDown) {
+                    self.toc_window_selection = self.toc_window_selection.saturating_add(1);
+                    self.toc_window_scroll_to_sel = true;
+                }
+                if i.key_pressed(egui::Key::ArrowUp) {
+                    self.toc_window_selection = self.toc_window_selection.saturating_sub(1);
+                    self.toc_window_scroll_to_sel = true;
                 }
             }
         });
@@ -585,25 +662,10 @@ impl eframe::App for EpubApp {
                             self.start_loading_from_path(&path.to_string_lossy());
                         }
                     }
-                    if ui.button("Open Directory...").clicked() {
-                        ui.close_menu();
-                        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                            if let Ok(entries) = std::fs::read_dir(&dir) {
-                                for entry in entries.flatten() {
-                                    let path = entry.path();
-                                    if path.extension().map_or(false, |e| e == "epub") {
-                                        self.start_loading_from_path(&path.to_string_lossy());
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
                     ui.separator();
                     if ui.button("Recent Files").clicked() {
                         ui.close_menu();
-                        self.show_recent = true;
-                        self.recent_search.clear();
+                        self.open_recent_files();
                     }
                     if ui.button("Settings").clicked() {
                         ui.close_menu();
@@ -621,6 +683,28 @@ impl eframe::App for EpubApp {
                             }
                         }
                     }
+                    if ui.button("Show Book Folder...").clicked() {
+                        ui.close_menu();
+                        match self.current_file_path.as_ref() {
+                            Some(path) => {
+                                let dir = std::path::Path::new(path)
+                                    .parent()
+                                    .filter(|p| !p.as_os_str().is_empty())
+                                    .unwrap_or_else(|| std::path::Path::new("."));
+                                if let Err(error) = open_directory(dir) {
+                                    self.status_message = Some(format!(
+                                        "Could not open book folder: {}",
+                                        error
+                                    ));
+                                    self.status_message_time = Some(std::time::Instant::now());
+                                }
+                            }
+                            None => {
+                                self.status_message = Some("No book loaded yet.".into());
+                                self.status_message_time = Some(std::time::Instant::now());
+                            }
+                        }
+                    }
                     ui.separator();
                     if ui.button("Restart").clicked() {
                         self.restart_app();
@@ -631,6 +715,14 @@ impl eframe::App for EpubApp {
                 });
 
                 ui.menu_button("View", |ui| {
+                    if ui.button("Table of Contents").clicked() {
+                        ui.close_menu();
+                        if self.show_toc_window {
+                            self.show_toc_window = false;
+                        } else {
+                            self.open_toc_window();
+                        }
+                    }
                     if ui.button("Fullscreen").clicked() {
                         ui.close_menu();
                         self.is_fullscreen = !self.is_fullscreen;
@@ -702,15 +794,20 @@ impl eframe::App for EpubApp {
         egui::Window::new("Recent Files")
             .open(&mut show_recent)
             .collapsible(false)
-            .resizable(true)
-            .default_size([500.0, 400.0])
+            .resizable([true, false])
+            .default_size([520.0, 520.0])
+            .min_size([280.0, 520.0])
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                let _search_response = ui.add(
+                let search_response = ui.add(
                     egui::TextEdit::singleline(&mut self.recent_search)
                         .hint_text("Search recent files...")
                         .desired_width(ui.available_width()),
                 );
+                if self.recent_needs_focus {
+                    search_response.request_focus();
+                    self.recent_needs_focus = false;
+                }
                 ui.separator();
 
                 let query = self.recent_search.to_lowercase();
@@ -733,8 +830,10 @@ impl eframe::App for EpubApp {
                     .collect();
 
                 // Clamp selection to valid range
-                if self.recent_selection >= filtered.len() {
-                    self.recent_selection = filtered.len().saturating_sub(1);
+                let clamped = filtered.len().saturating_sub(1);
+                if self.recent_selection != clamped && self.recent_selection >= filtered.len() {
+                    self.recent_selection = clamped;
+                    self.recent_scroll_to_sel = true;
                 }
 
                 // Enter key opens the selected file (works even without search focus)
@@ -782,8 +881,9 @@ impl eframe::App for EpubApp {
                             if response.clicked() {
                                 to_open = Some(path.clone());
                             }
-                            if selected {
+                            if selected && self.recent_scroll_to_sel {
                                 response.scroll_to_me(Some(egui::Align::Center));
+                                self.recent_scroll_to_sel = false;
                             }
                             if ui.small_button("X").clicked() {
                                 to_remove = Some(idx);
@@ -805,6 +905,125 @@ impl eframe::App for EpubApp {
             });
         if !show_recent {
             self.show_recent = false;
+        }
+
+        // ─── Table of contents window (Ctrl+G) ──────────────────────
+        // Build the flat entry list while the document is borrowed, then run
+        // the window outside the borrow so navigation can mutate app state.
+        let toc_window_data: Option<Vec<(String, usize)>> = if let Some(doc) = &self.document {
+            let mut flat: Vec<(String, usize)> = Vec::new();
+            collect_toc_flat(&doc.toc, &mut flat);
+            let mut in_tree = HashSet::new();
+            for entry in &doc.toc {
+                collect_toc_chapters(entry, &mut in_tree);
+            }
+            for (i, chapter) in doc.chapters.iter().enumerate() {
+                if !in_tree.contains(&i) {
+                    flat.push((chapter.label.clone(), i));
+                }
+            }
+            Some(flat)
+        } else {
+            None
+        };
+        if let Some(flat) = toc_window_data {
+            let mut show_toc_window = self.show_toc_window;
+            egui::Window::new("Table of Contents")
+                .open(&mut show_toc_window)
+                .collapsible(false)
+                .resizable([true, false])
+                .default_size([520.0, 520.0])
+                .min_size([280.0, 520.0])
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    let search_response = ui.add(
+                        egui::TextEdit::singleline(&mut self.toc_window_search)
+                            .hint_text("Search chapters...")
+                            .desired_width(ui.available_width()),
+                    );
+                    if self.toc_window_needs_focus {
+                        search_response.request_focus();
+                        self.toc_window_needs_focus = false;
+                    }
+                    ui.separator();
+
+                    let query = self.toc_window_search.to_lowercase();
+                    let filtered: Vec<(String, usize)> = flat
+                        .iter()
+                        .filter(|(label, _)| {
+                            query.is_empty() || label.to_lowercase().contains(&query)
+                        })
+                        .cloned()
+                        .collect();
+
+                    let clamped = filtered.len().saturating_sub(1);
+                    if self.toc_window_selection != clamped
+                        && self.toc_window_selection >= filtered.len()
+                    {
+                        self.toc_window_selection = clamped;
+                        self.toc_window_scroll_to_sel = true;
+                    }
+
+                    // Enter opens the selected chapter
+                    let enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+                    let mut to_navigate: Option<usize> = None;
+                    if enter_pressed && !filtered.is_empty() {
+                        to_navigate = Some(filtered[self.toc_window_selection].1);
+                    }
+
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        if filtered.is_empty() {
+                            if flat.is_empty() {
+                                ui.label("No chapters found.");
+                            } else {
+                                ui.label("No matches.");
+                            }
+                        }
+                        let current = self.current_chapter;
+                        for (list_i, (label, chapter_idx)) in filtered.iter().enumerate() {
+                            let selected = list_i == self.toc_window_selection;
+                            let highlighted = selected
+                                || (query.is_empty() && *chapter_idx == current);
+                            ui.horizontal(|ui| {
+                                let response = ui.add_sized(
+                                    [ui.available_width() - 4.0, 0.0],
+                                    egui::Button::new(egui::RichText::new(label))
+                                        .fill(if highlighted {
+                                            ui.visuals().selection.bg_fill
+                                        } else {
+                                            Color32::TRANSPARENT
+                                        })
+                                        .stroke(if highlighted {
+                                            egui::Stroke::new(
+                                                1.0_f32,
+                                                ui.visuals().selection.stroke.color,
+                                            )
+                                        } else {
+                                            egui::Stroke::NONE
+                                        })
+                                        .wrap_mode(egui::TextWrapMode::Truncate),
+                                );
+                                if response.clicked() {
+                                    to_navigate = Some(*chapter_idx);
+                                }
+                                if selected && self.toc_window_scroll_to_sel {
+                                    response.scroll_to_me(Some(egui::Align::Center));
+                                    self.toc_window_scroll_to_sel = false;
+                                }
+                            });
+                        }
+                    });
+
+                    if let Some(idx) = to_navigate {
+                        self.set_chapter(idx);
+                        self.show_toc_window = false;
+                        self.toc_window_search.clear();
+                        self.toc_window_selection = 0;
+                    }
+                });
+            if !show_toc_window {
+                self.show_toc_window = false;
+            }
         }
 
         // ─── Main content ─────────────────────────────────────────
@@ -1140,6 +1359,7 @@ impl eframe::App for EpubApp {
                         align,
                         self.font_loaded,
                         &mut self.reset_chapter_scroll,
+                        self.config.show_minimap,
                     ) {
                         chapter_to_set = Some(requested);
                     }

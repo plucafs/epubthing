@@ -508,9 +508,39 @@ pub(crate) fn strip_html(html: &str) -> String {
     cleaned.trim().to_string()
 }
 
+/// Extracts the first meaningful title of a chapter's HTML: the text of
+/// `<title>` when present, otherwise the first `<h1>` to `<h6>` heading.
+/// Used to label spine chapters that the book's own TOC does not reference.
+pub fn first_heading_text(html: &str) -> Option<String> {
+    for tag in ["title", "h1", "h2", "h3", "h4", "h5", "h6"] {
+        let open = format!("<{tag}");
+        let close = format!("</{tag}>");
+        let lower = html.to_ascii_lowercase();
+        let mut search_from = 0;
+        while let Some(rel) = lower[search_from..].find(&open) {
+            let start = search_from + rel;
+            let Some(tag_end) = lower[start..].find('>') else {
+                break;
+            };
+            let content_start = start + tag_end + 1;
+            if let Some(rel_close) = lower[content_start..].find(&close) {
+                let content_end = content_start + rel_close;
+                let text = strip_html(&html[content_start..content_end]);
+                if !text.is_empty() {
+                    return Some(text);
+                }
+                search_from = content_start; // skip empties, keep scanning
+            } else {
+                break;
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_html_segments, resolve_path};
+    use super::{first_heading_text, parse_html_segments, resolve_path};
     use crate::types::ContentSegment;
 
     fn flattened_text(html: &str) -> String {
@@ -571,6 +601,25 @@ mod tests {
             flattened_text("<p>Hello <em>world</em>!</p>"),
             "Hello world!\n"
         );
+    }
+
+    #[test]
+    fn extracts_first_heading_preferring_title() {
+        let html = "<html><head><title>I: Loomings</title></head><body>\n\
+                    <section><hgroup><h2>I</h2><p>Loomings</p></hgroup><p>Call me Ishmael.</p></section>\n\
+                    </body></html>";
+        assert_eq!(first_heading_text(html).as_deref(), Some("I: Loomings"));
+    }
+
+    #[test]
+    fn falls_back_to_first_h_heading() {
+        let html = "<body><div><h3>Chapter One</h3></div><p>text</p></body>";
+        assert_eq!(first_heading_text(html).as_deref(), Some("Chapter One"));
+    }
+
+    #[test]
+    fn returns_none_without_title_or_heading() {
+        assert_eq!(first_heading_text("<p>No headings here</p>"), None);
     }
 
     #[test]
